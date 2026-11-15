@@ -17,7 +17,7 @@
   var seed={},local={sets:{},dels:{}},subs={},ready=null;
   try{var raw=localStorage.getItem(KEY);if(raw){var p=JSON.parse(raw);local.sets=p.sets||{};local.dels=p.dels||{}}}catch(e){}
   function persist(){try{localStorage.setItem(KEY,JSON.stringify(local))}catch(e){alertBar("This browser is out of space for saved changes. Use Export to keep them.")}}
-  function load(){if(!ready)ready=fetch("data.json",{cache:"no-store"}).then(function(r){return r.ok?r.json():{data:{}}}).catch(function(){return{data:{}}}).then(function(j){seed=j.data||{};return seed});return ready}
+  function load(){if(!ready)ready=fetch("data.json?v="+Date.now(),{cache:"no-store"}).then(function(r){return r.ok?r.json():{data:{}}}).catch(function(){return{data:{}}}).then(function(j){seed=j.data||{};return seed});return ready}
   function docsOf(col){
     var m={};(seed[col]||[]).forEach(function(d){m[d.id]=d.data});
     var s=local.sets[col]||{},dl=local.dels[col]||{};
