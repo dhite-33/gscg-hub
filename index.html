@@ -4,41 +4,93 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="robots" content="noindex,nofollow">
-<style>:root{padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}body{margin:0}img{max-width:100%}[hidden]{display:none!important}</style>
+<style>:root{padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}body{margin:0}img{max-width:100%}[hidden]{display:none!important}.gsbar{display:flex;flex-wrap:wrap;gap:8px 14px;align-items:center;justify-content:space-between;background:#E4002B;color:#fff;font:600 13px Barlow,system-ui,sans-serif;padding:6px max(16px,env(safe-area-inset-left,0px))}.gsbar .gsacts{display:flex;gap:6px;flex-wrap:wrap}.gsbar button,.gsbar .gsimp{border:1px solid rgba(255,255,255,.8);background:transparent;color:#fff;border-radius:99px;padding:3px 10px;font:700 12px Barlow,system-ui,sans-serif;cursor:pointer}.gsbar button:hover,.gsbar .gsimp:hover{background:rgba(255,255,255,.15)}</style>
 <script>
-/* GSCG Hub backend bridge: gives the page the same claude.use() calls it had as a Claude page,
-   backed by this site's own API (Cloudflare D1 for data, R2 for photos and videos). */
+/* GSCG Hub, GitHub Pages edition.
+   The page keeps the claude.use() calls it had as a Claude page. Here they are answered from:
+   - data.json in this repo (the shared starting point everyone sees), plus
+   - each person's own changes, saved in their browser (localStorage for posts and records,
+     IndexedDB for photos and videos they upload).
+   Export/Import moves one person's changes to someone else as a file. */
 (function(){
-  if(window.claude&&window.claude.use)return;
-  var subs={},cache={},lastSig="",timer=null,meP=null;
-  function api(path,opt){return fetch(path,Object.assign({credentials:"same-origin",cache:"no-store"},opt||{}))}
-  function emit(col){var docs=(cache[col]||[]).map(function(d){return{id:d.id,data:function(){return d.data}}});(subs[col]||[]).forEach(function(s){try{s.cb({docs:docs})}catch(e){}})}
-  function fail(e){Object.keys(subs).forEach(function(c){subs[c].forEach(function(s){if(s.err)try{s.err(e)}catch(x){}})})}
-  function pull(){return api("/api/all").then(function(r){if(r.status===403||r.status===401)throw{code:"not_allowed"};if(!r.ok)throw{code:"http_"+r.status};return r.json()}).then(function(j){if(j.sig===lastSig)return;lastSig=j.sig;cache=j.data||{};Object.keys(subs).forEach(emit)})}
-  function start(){if(timer)return;pull().catch(fail);timer=setInterval(function(){if(!document.hidden)pull().catch(function(){})},5000);document.addEventListener("visibilitychange",function(){if(!document.hidden)pull().catch(function(){})})}
-  function local(col,id,o){var a=(cache[col]||[]).filter(function(d){return d.id!==id});if(o)a.push({id:id,data:o});cache[col]=a;lastSig="";emit(col)}
-  function docPath(col,id){return "/api/db/"+encodeURIComponent(col)+"/"+encodeURIComponent(id)}
+  var KEY="gscg-hub-local-v1",FILEDB="gscg-hub-files",STORE="files";
+  var seed={},local={sets:{},dels:{}},subs={},ready=null;
+  try{var raw=localStorage.getItem(KEY);if(raw){var p=JSON.parse(raw);local.sets=p.sets||{};local.dels=p.dels||{}}}catch(e){}
+  function persist(){try{localStorage.setItem(KEY,JSON.stringify(local))}catch(e){alertBar("This browser is out of space for saved changes. Use Export to keep them.")}}
+  function load(){if(!ready)ready=fetch("data.json",{cache:"no-store"}).then(function(r){return r.ok?r.json():{data:{}}}).catch(function(){return{data:{}}}).then(function(j){seed=j.data||{};return seed});return ready}
+  function docsOf(col){
+    var m={};(seed[col]||[]).forEach(function(d){m[d.id]=d.data});
+    var s=local.sets[col]||{},dl=local.dels[col]||{};
+    Object.keys(s).forEach(function(id){m[id]=s[id]});
+    Object.keys(dl).forEach(function(id){delete m[id]});
+    return Object.keys(m).map(function(id){return{id:id,data:m[id]}});
+  }
+  function emit(col){var docs=docsOf(col).map(function(d){return{id:d.id,data:function(){return d.data}}});(subs[col]||[]).forEach(function(cb){try{cb({docs:docs})}catch(e){}})}
+  function emitAll(){Object.keys(subs).forEach(emit)}
   var db={collection:function(col){return{
-    onSnapshot:function(cb,err){(subs[col]=subs[col]||[]).push({cb:cb,err:err});start();if(lastSig)emit(col);return function(){}},
+    onSnapshot:function(cb){(subs[col]=subs[col]||[]).push(cb);load().then(function(){emit(col)});return function(){}},
     doc:function(id){return{
-      set:function(o){return api(docPath(col,id),{method:"PUT",headers:{"content-type":"application/json"},body:JSON.stringify(o)}).then(function(r){if(!r.ok)throw{code:r.status===403?"invalid_argument":"http_"+r.status};local(col,id,o)})},
-      delete:function(){return api(docPath(col,id),{method:"DELETE"}).then(function(r){if(!r.ok)throw{code:"http_"+r.status};local(col,id,null)})}
+      set:function(o){(local.sets[col]=local.sets[col]||{})[id]=JSON.parse(JSON.stringify(o));if(local.dels[col])delete local.dels[col][id];persist();emit(col);markDirty();return Promise.resolve()},
+      delete:function(){if(local.sets[col])delete local.sets[col][id];(local.dels[col]=local.dels[col]||{})[id]=1;persist();emit(col);markDirty();return Promise.resolve()}
     }}
   }}};
+  /* files people upload: kept in IndexedDB, served at blob/local-* by sw.js */
+  function idb(){return new Promise(function(res,rej){var r=indexedDB.open(FILEDB,1);r.onupgradeneeded=function(){r.result.createObjectStore(STORE)};r.onsuccess=function(){res(r.result)};r.onerror=function(){rej(r.error)}})}
+  function idbPut(k,v){return idb().then(function(d){return new Promise(function(res,rej){var tx=d.transaction(STORE,"readwrite");tx.objectStore(STORE).put(v,k);tx.oncomplete=res;tx.onerror=function(){rej(tx.error)}})})}
+  function idbDel(k){return idb().then(function(d){return new Promise(function(res){var tx=d.transaction(STORE,"readwrite");tx.objectStore(STORE).delete(k);tx.oncomplete=res;tx.onerror=res})})}
+  function idbAll(){return idb().then(function(d){return new Promise(function(res){var out={},tx=d.transaction(STORE,"readonly"),st=tx.objectStore(STORE),c=st.openCursor();c.onsuccess=function(){var cur=c.result;if(cur){out[cur.key]=cur.value;cur.continue()}else res(out)};c.onerror=function(){res(out)}})})}
+  var EXT={"image/jpeg":".jpg","image/png":".png","image/gif":".gif","image/webp":".webp","video/mp4":".mp4","video/quicktime":".mov","video/webm":".webm","image/svg+xml":".svg"};
   var assets={
-    upload:function(blob,opt){var type=(opt&&opt.type)||blob.type||"application/octet-stream";return api("/api/files",{method:"POST",headers:{"content-type":type},body:blob}).then(function(r){if(r.status===413)throw{code:"too_large"};if(!r.ok)throw{code:"http_"+r.status};return r.json()})},
-    delete:function(id){return api("/api/files/"+encodeURIComponent(id),{method:"DELETE"}).then(function(){})},
+    upload:function(blob,opt){var type=(opt&&opt.type)||blob.type||"application/octet-stream";if(blob.size>60*1024*1024)return Promise.reject({code:"too_large"});var id="local-"+Date.now().toString(36)+Math.random().toString(36).slice(2,8)+(EXT[type]||"");var b=blob.type===type?blob:new Blob([blob],{type:type});return idbPut(id,b).then(function(){markDirty();return{id:id,url:"blob/"+id,contentType:type,sizeBytes:b.size}})},
+    delete:function(id){return /^local-/.test(id)?idbDel(id):Promise.resolve()},
     list:function(){return Promise.resolve({assets:[],usage:{}})}
   };
-  function me(){if(!meP)meP=api("/api/me").then(function(r){return r.ok?r.json():{}}).catch(function(){return{}});return meP}
-  var user={me:function(){return me()},id:function(){return me().then(function(m){return m.email||""})},can:function(){return Promise.resolve(true)},isOwner:function(){return false},canEdit:function(){return true}};
-  var downloads={save:function(o){var url=URL.createObjectURL(o.data instanceof Blob?o.data:new Blob([o.data]));var a=document.createElement("a");a.href=url;a.download=o.filename||"download";document.body.appendChild(a);a.click();a.remove();setTimeout(function(){URL.revokeObjectURL(url)},4000);return Promise.resolve()}};
+  var user={me:function(){return Promise.resolve({})},id:function(){return Promise.resolve("")},can:function(){return Promise.resolve(true)},isOwner:function(){return false},canEdit:function(){return true}};
+  function saveFile(name,blob){var url=URL.createObjectURL(blob);var a=document.createElement("a");a.href=url;a.download=name;document.body.appendChild(a);a.click();a.remove();setTimeout(function(){URL.revokeObjectURL(url)},5000)}
+  var downloads={save:function(o){saveFile(o.filename||"download",o.data instanceof Blob?o.data:new Blob([o.data]));return Promise.resolve()}};
   var map={db:db,assets:assets,user:user,downloads:downloads};
   window.claude={use:function(n){return Promise.resolve(map[n]||null)}};
+
+  /* service worker that serves locally uploaded files */
+  if("serviceWorker" in navigator){navigator.serviceWorker.register("sw.js").catch(function(){})}
+
+  /* export / import / reset */
+  function blobToData(b){return new Promise(function(res){var r=new FileReader();r.onload=function(){res(r.result)};r.readAsDataURL(b)})}
+  function dataToBlob(u){return fetch(u).then(function(r){return r.blob()})}
+  function count(){var n=0;Object.keys(local.sets).forEach(function(c){n+=Object.keys(local.sets[c]).length});Object.keys(local.dels).forEach(function(c){n+=Object.keys(local.dels[c]).length});return n}
+  function markDirty(){var b=document.getElementById("gsExp");if(b)b.textContent="Export my changes ("+count()+")"}
+  window.GSCG={
+    exportChanges:function(){
+      var who=(document.querySelector("#roleSel")||{}).value||"";
+      idbAll().then(function(files){var keys=Object.keys(files),out={};return Promise.all(keys.map(function(k){return blobToData(files[k]).then(function(d){out[k]=d})})).then(function(){return out})}).then(function(files){
+        var payload={app:"gscg-hub",exported:new Date().toISOString(),from:String(who).replace(/^p:/,""),sets:local.sets,dels:local.dels,files:files};
+        var stamp=new Date().toISOString().slice(0,16).replace(/[:T]/g,"-");
+        saveFile("gscg-hub-changes-"+stamp+".json",new Blob([JSON.stringify(payload)],{type:"application/json"}));
+      });
+    },
+    importChanges:function(file){
+      return file.text().then(function(txt){var p=JSON.parse(txt);if(p.app!=="gscg-hub")throw new Error("Not a GSCG Hub file");
+        Object.keys(p.sets||{}).forEach(function(c){local.sets[c]=local.sets[c]||{};Object.keys(p.sets[c]).forEach(function(id){local.sets[c][id]=p.sets[c][id];if(local.dels[c])delete local.dels[c][id]})});
+        Object.keys(p.dels||{}).forEach(function(c){local.dels[c]=local.dels[c]||{};Object.keys(p.dels[c]).forEach(function(id){local.dels[c][id]=1;if(local.sets[c])delete local.sets[c][id]})});
+        persist();
+        var fs=p.files||{};return Promise.all(Object.keys(fs).map(function(k){return dataToBlob(fs[k]).then(function(b){return idbPut(k,b)})})).then(function(){emitAll();markDirty();return p.from||"someone"});
+      });
+    },
+    reset:function(){local={sets:{},dels:{}};persist();emitAll();markDirty()}
+  };
+  function alertBar(t){var b=document.getElementById("gsNote");if(b)b.textContent=t}
+  document.addEventListener("DOMContentLoaded",function(){
+    var bar=document.createElement("div");bar.className="gsbar";
+    bar.innerHTML='<span id="gsNote"><b>Team preview.</b> Your changes save in this browser only. Send them to Dylan with Export.</span><span class="gsacts"><button type="button" id="gsExp">Export my changes</button><label class="gsimp">Import changes<input type="file" id="gsImp" accept="application/json,.json" hidden></label><button type="button" id="gsReset">Reset to shared version</button></span>';
+    document.body.insertBefore(bar,document.body.firstChild);markDirty();
+    document.getElementById("gsExp").onclick=function(){window.GSCG.exportChanges()};
+    document.getElementById("gsImp").onchange=function(e){var f=e.target.files[0];e.target.value="";if(!f)return;window.GSCG.importChanges(f).then(function(from){alertBar("Imported changes from "+from+".")}).catch(function(err){alertBar("Could not import that file: "+(err&&err.message||err))})};
+    var armed=false;document.getElementById("gsReset").onclick=function(){if(!armed){armed=true;this.textContent="Click again to erase your changes";var s=this;setTimeout(function(){armed=false;s.textContent="Reset to shared version"},4000);return}armed=false;window.GSCG.reset();this.textContent="Reset to shared version";alertBar("Back to the shared version.")};
+  });
 })();
 
 </script>
-<title>GSCG Marketing Hub Brain</title>
+<title>GSCG Hub</title>
 <meta name="claude:viewport-fit-sides" content="cover">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -535,7 +587,7 @@ async function initStore(){
   try{S.db=await claude.use("db")}catch(e){S.db=null}
   try{S.assets=await claude.use("assets")}catch(e){S.assets=null}
   try{S.dl=await claude.use("downloads")}catch(e){S.dl=null}
-  try{const u=await claude.use("user");if(u){try{const m=await u.me();if(m&&m.name){S.meName=m.name;const pp=personByName(m.name);if(pp){S.me=pp.n;S.role=pp.r;renderRoleSel();const rs=document.querySelector(".role");if(rs)rs.style.display="none"}}}catch(e){}const w=await u.can("data.write");if(w===false||w==="false")S.canWrite=false}}catch(e){}
+  try{const u=await claude.use("user");if(u){try{const m=await u.me();if(m&&m.name){S.meName=m.name;if(!S.me){const pp=personByName(m.name);if(pp){S.me=pp.n;S.role=pp.r;renderRoleSel()}}}}catch(e){}const w=await u.can("data.write");if(w===false||w==="false")S.canWrite=false}}catch(e){}
   if(!S.db){S.offline=true;S.loaded=true;render(true);return}
   const t=setTimeout(()=>{if(!S.loaded){S.loaded=true;S.slow=true;render(true)}},10000);
   const done=()=>{clearTimeout(t);S.loaded=true;S.slow=false;render()};
@@ -962,7 +1014,7 @@ function drawFormat(){
    +'<p class="hint" style="margin:4px 0 0">'+esc(LANE[lane].note)+(F?"":" Pick a format to use the Standard lane.")+'</p>';
   if(F){
     h+='<p class="hint" style="margin:8px 0 0"><b>'+esc(F.name)+'.</b> '+esc(F.about)+'</p><div class="fgrid">'+F.fields.map(x=>{const v=B.fmt.f[x.k]||"";return '<label class="'+(x.area||x.wide?"wide":"")+'">'+esc(x.l)+(x.area?'<textarea id="ff_'+x.k+'" maxlength="'+x.max+'" '+(ro?"disabled":"")+'>'+esc(v)+'</textarea>':'<input type="text" id="ff_'+x.k+'" maxlength="'+x.max+'" placeholder="'+esc(x.ph||"")+'" value="'+esc(v)+'" '+(ro?"disabled":"")+'>')+'</label>'}).join("")+'</div>';
-    if(F.photo)h+='<div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap"><span class="hint" style="margin:0">Photo (optional)</span>'+(B.fmt.photo?'<img alt="Chosen photo" src="/blob/'+esc(B.fmt.photo)+'" style="width:44px;height:44px;object-fit:cover;border-radius:6px">':"")+(ro?"":'<button class="btn sm" type="button" data-act="fmtphoto">Choose photo</button>'+(B.fmt.photo?'<button class="btn sm" type="button" data-act="fmtnophoto">Remove</button>':""))+'</div><div id="b_fphotos"></div>';
+    if(F.photo)h+='<div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap"><span class="hint" style="margin:0">Photo (optional)</span>'+(B.fmt.photo?'<img alt="Chosen photo" src="blob/'+esc(B.fmt.photo)+'" style="width:44px;height:44px;object-fit:cover;border-radius:6px">':"")+(ro?"":'<button class="btn sm" type="button" data-act="fmtphoto">Choose photo</button>'+(B.fmt.photo?'<button class="btn sm" type="button" data-act="fmtnophoto">Remove</button>':""))+'</div><div id="b_fphotos"></div>';
     if(!ro)h+='<div class="acts" style="margin-top:10px"><button class="btn primary sm" type="button" data-act="fmtgen">Make graphics ('+F.slides+' slide'+(F.slides>1?"s":"")+')</button><button class="btn sm" type="button" data-act="fmtcap">Write caption from these fields</button></div>';
   }
   el.innerHTML=h+'</div>';
@@ -980,7 +1032,7 @@ async function genSlides(){
   const first=F.fields[0];if(!String(f[first.k]||"").trim()){toast("Fill in “"+first.l+"” first.");return}
   toast("Making graphics…");
   try{await document.fonts.load("700 100px 'Barlow Condensed'");await document.fonts.load("600 40px Barlow");await document.fonts.load("700 40px Barlow")}catch(e){}
-  const L={white:await loadImg(LOGOS.white),red:await loadImg(LOGOS.red)},ph=B.fmt.photo?await loadImg("/blob/"+B.fmt.photo):null;
+  const L={white:await loadImg(LOGOS.white),red:await loadImg(LOGOS.red)},ph=B.fmt.photo?await loadImg("blob/"+B.fmt.photo):null;
   let cs;try{cs=F.build(L,f,ph)}catch(e){toast("Could not make the graphics.");return}
   const ids=[];
   for(const c of cs){const blob=await new Promise(r=>c.toBlob(r,"image/jpeg",.92));try{const r=await S.assets.upload(blob,{type:"image/jpeg"});ids.push(r.id)}catch(e){toast("Could not save a slide.");return}}
@@ -1322,7 +1374,7 @@ function stBuild(x,w){
   let h='<h3 class="pst-h">Build the cut</h3><p class="hint" style="margin:0 0 10px">Copy the brief into the editor (Mateo\'s engine or any editing app), make the cut, then add it here.</p>'
    +'<div class="acts" style="margin-top:0"><button class="btn primary sm" data-act="copybrief" data-id="'+x.id+'">Copy brief for the editor</button></div>';
   if(w)h+='<div class="fmtbox" style="margin-top:14px"><b>Add a cut</b><div class="fgrid"><label>Name<input type="text" id="cut_title" value="Cut '+(cuts.length+1)+'"></label><label>Made for<select id="cut_plat">'+PLAT.map(p=>'<option value="'+p[0]+'"'+(((x.platforms||[])[0]||"reels")===p[0]?" selected":"")+'>'+esc(p[1])+' '+p[2]+'</option>').join("")+'</select></label><label class="wide">Link to the full cut (OneDrive, Drive, YouTube unlisted)<input type="url" id="cut_link" placeholder="https://"></label><label class="wide">Video file<input type="file" id="cut_file" accept="video/*,.mov,.mp4,.m4v"></label></div><p class="hint" style="margin:6px 0 0">Files up to 20 MB play right here. Bigger files get a cover still from their first frames; add a link so reviewers can watch the full cut.</p><div class="acts"><button class="btn primary sm" data-act="addcut" data-id="'+x.id+'">Add cut for review</button></div></div>';
-  if(cuts.length)h+='<p style="margin-top:14px"><b>Cuts so far</b></p><div class="cutgrid">'+cuts.map(c=>'<div class="cutmini">'+(c.stillId?'<img alt="" src="/blob/'+esc(c.stillId)+'">':'<div class="cm0">No cover</div>')+'<b>'+esc(c.title||"Cut")+'</b><span>'+esc(PLATN[c.platform]||"")+'</span><span class="pill '+(c.status==="approved"?"done":c.status==="changes"?"bad":"prog")+'">'+(c.status==="approved"?"Approved":c.status==="changes"?"Changes":"In review")+'</span></div>').join("")+'</div>';
+  if(cuts.length)h+='<p style="margin-top:14px"><b>Cuts so far</b></p><div class="cutgrid">'+cuts.map(c=>'<div class="cutmini">'+(cutPoster(c)?'<img alt="" src="'+esc(cutPoster(c))+'">':'<div class="cm0">No cover</div>')+'<b>'+esc(c.title||"Cut")+'</b><span>'+esc(PLATN[c.platform]||"")+'</span><span class="pill '+(c.status==="approved"?"done":c.status==="changes"?"bad":"prog")+'">'+(c.status==="approved"?"Approved":c.status==="changes"?"Changes":"In review")+'</span></div>').join("")+'</div>';
   return h;
 }
 function stReview(x){
@@ -1336,7 +1388,7 @@ function stPost(x,w,T){
   if(!ok.length)h+='<p class="empty">No approved cut yet. Approve one in Review first.</p>';
   ok.forEach(c=>{
     const ch=c.platform==="linkedin"?"linkedin":"instagram",already=posts.find(p=>p.video&&p.video.stillId&&p.video.stillId===c.stillId);
-    h+='<div class="pkit">'+(c.stillId?'<img alt="" src="/blob/'+esc(c.stillId)+'">':'<div class="cm0">No cover</div>')+'<div style="flex:1;min-width:220px"><b>'+esc(c.title||"Cut")+' · '+esc(PLATN[c.platform]||"")+'</b>'
+    h+='<div class="pkit">'+(cutPoster(c)?'<img alt="" src="'+esc(cutPoster(c))+'">':'<div class="cm0">No cover</div>')+'<div style="flex:1;min-width:220px"><b>'+esc(c.title||"Cut")+' · '+esc(PLATN[c.platform]||"")+'</b>'
      +(already?'<p style="margin:6px 0">Post created: <button class="btn sm" data-act="editpost" data-id="'+already.id+'">'+esc(already.title||"Open post")+'</button> <span class="mm">'+esc((STAGES.find(s=>s.id===already.stage)||STAGES[0]).name)+'</span></p>'
       :(w?'<div class="fgrid"><label>Channel<select id="pk_ch_'+c.id+'"><option value="instagram"'+(ch==="instagram"?" selected":"")+'>Instagram</option><option value="linkedin"'+(ch==="linkedin"?" selected":"")+'>LinkedIn</option></select></label><label>Date<input type="date" id="pk_d_'+c.id+'"></label><label>Time<input type="time" id="pk_t_'+c.id+'" value="12:00"></label><label class="wide">Caption<textarea id="pk_c_'+c.id+'" style="min-height:80px" placeholder="'+esc(T?T.hint:"Write the caption")+'"></textarea></label></div><div class="acts"><button class="btn primary sm" data-act="pkmake" data-id="'+c.id+'">Create the post</button></div><p class="hint" style="margin:6px 0 0">The post opens in the builder with this cut attached. It then goes through the quality check and approvals like any post.</p>':""))
      +'</div></div>';
@@ -1351,16 +1403,17 @@ async function pkMake(cid){
   openPost(null,g("d"),{title:(x.name||"Video")+" · "+(c.title||"cut"),owner:x.owner||"",ctype:x.ctype||"",pillars:(x.pillars||[]).slice(),aud:T?T.a.slice():[],project:x.id||"",channel:g("ch")||"instagram",date:g("d"),time:g("t")||"12:00",caption:g("c"),type:"Recap",notes:"Made from "+(c.title||"a cut")+", approved by "+((c.decision&&c.decision.by)||"a reviewer")+".",video:v});
 }
 async function saveProj(id,patch,msg){const x=S.projects.find(q=>q.id===id);if(!x)return;if(await saveDoc("projects",id,{...x,...patch,updated:Date.now()})){render(true);toast(msg||"Saved")}}
+const cutPoster=c=>c.stillId?"blob/"+c.stillId:(c.poster||"");
 function cutCard(c){
   const st=c.status||"review",pill=st==="approved"?'<span class="pill done">Approved</span>':st==="changes"?'<span class="pill bad">Changes requested</span>':'<span class="pill prog">In review</span>';
-  const media=c.assetId?'<video id="cv_'+c.id+'" controls playsinline preload="metadata" src="/blob/'+esc(c.assetId)+'"'+(c.stillId?' poster="/blob/'+esc(c.stillId)+'"':"")+'></video>':c.stillId?'<img class="cv" alt="Cover still for '+esc(c.title||"cut")+'" src="/blob/'+esc(c.stillId)+'">':"";
+  const pst=cutPoster(c),media=(c.assetId||c.src)?'<video id="cv_'+c.id+'" controls playsinline preload="metadata" src="'+esc(c.assetId?"blob/"+c.assetId:c.src)+'"'+(pst?' poster="'+esc(pst)+'"':"")+'></video>':pst?'<img class="cv" alt="Cover still for '+esc(c.title||"cut")+'" src="'+esc(pst)+'">':"";
   let h='<div class="mcard cutc'+(st==="changes"?" chgc":"")+'" style="margin-bottom:12px"><div class="ckh"><h4 style="margin:0">'+esc(c.title||"Cut")+'</h4>'+pill+'</div><p class="mm" style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">'+av(c.by,20)+esc(PLATN[c.platform]||"")+' · added by '+esc(c.by||"someone")+' · '+esc(fmtStamp(c.created||0))+'</p>'+media
-   +(c.link?'<p><a href="'+esc(c.link)+'" target="_blank" rel="noopener">Watch the full cut</a></p>':(!c.assetId?'<p class="hint">Only the cover is stored. Add a link to the full cut so reviewers can watch it.</p>':""));
+   +(c.link?'<p><a href="'+esc(c.link)+'" target="_blank" rel="noopener">Watch the full cut</a></p>':(!c.assetId&&!c.src?'<p class="hint">Only the cover is stored. Add a link to the full cut so reviewers can watch it.</p>':""));
   if(c.decision)h+='<div class="cnote" style="margin-top:8px"><b>'+(st==="approved"?"Approved by ":"Changes requested by ")+esc(c.decision.by)+'</b>'+esc(c.decision.comment||"")+'</div>';
   const notes=(c.notes||[]);
-  h+='<p style="margin-top:10px"><b>Feedback ('+notes.length+')</b></p>'+(notes.length?notes.map(n=>'<div class="fnote">'+av(n.by,20)+' '+(n.t!=null?(c.assetId?'<button class="ts" data-act="seek" data-id="'+c.id+'" data-t="'+n.t+'" title="Jump to this moment">'+fmtSec(n.t)+'</button>':'<span class="ts">'+fmtSec(n.t)+'</span>'):"")+'<b>'+esc(n.by)+'</b> '+esc(n.text)+' <span class="mm">'+esc(fmtStamp(n.at))+'</span></div>').join(""):'<p class="hint" style="margin:0">No feedback yet.</p>');
+  h+='<p style="margin-top:10px"><b>Feedback ('+notes.length+')</b></p>'+(notes.length?notes.map(n=>'<div class="fnote">'+av(n.by,20)+' '+(n.t!=null?((c.assetId||c.src)?'<button class="ts" data-act="seek" data-id="'+c.id+'" data-t="'+n.t+'" title="Jump to this moment">'+fmtSec(n.t)+'</button>':'<span class="ts">'+fmtSec(n.t)+'</span>'):"")+'<b>'+esc(n.by)+'</b> '+esc(n.text)+' <span class="mm">'+esc(fmtStamp(n.at))+'</span></div>').join(""):'<p class="hint" style="margin:0">No feedback yet.</p>');
   if(S.canWrite){
-    h+='<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px;align-items:flex-end"><textarea id="cn_'+c.id+'" placeholder="Feedback on this cut" style="flex:1;min-width:200px;min-height:44px"></textarea>'+(c.assetId?'<label class="why" style="padding:0"><input type="checkbox" id="cnt_'+c.id+'" checked> At the current moment</label>':"")+'<button class="btn sm" data-act="cutnote" data-id="'+c.id+'">Add feedback</button></div>';
+    h+='<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px;align-items:flex-end"><textarea id="cn_'+c.id+'" placeholder="Feedback on this cut" style="flex:1;min-width:200px;min-height:44px"></textarea>'+((c.assetId||c.src)?'<label class="why" style="padding:0"><input type="checkbox" id="cnt_'+c.id+'" checked> At the current moment</label>':"")+'<button class="btn sm" data-act="cutnote" data-id="'+c.id+'">Add feedback</button></div>';
     h+='<div class="acts">'+(isApprover()&&st!=="approved"?'<button class="btn good sm" data-act="cutok" data-id="'+c.id+'">Approve cut</button><button class="btn sm" data-act="cutchg" data-id="'+c.id+'">Request changes</button>':"")
      +(st==="approved"?'<button class="btn primary sm" data-act="cutpost" data-id="'+c.id+'">Make a post from this cut</button>':"")
      +'<span class="sp"></span><button class="btn danger sm" data-act="delcut" data-id="'+c.id+'">Delete</button></div>';
@@ -1480,7 +1533,7 @@ function mediaOf(p){
   return a;
 }
 async function pngBlobOf(id){
-  const img=await loadImg("/blob/"+id);if(!img)throw new Error("load");
+  const img=await loadImg("blob/"+id);if(!img)throw new Error("load");
   const c=document.createElement("canvas");c.width=img.naturalWidth;c.height=img.naturalHeight;c.getContext("2d").drawImage(img,0,0);
   return await new Promise((res,rej)=>c.toBlob(b=>b?res(b):rej(new Error("png")),"image/png"));
 }
@@ -1488,7 +1541,7 @@ function openKit(id){
   const p=S.posts.find(x=>x.id===id);if(!p)return;const items=mediaOf(p),ch=(CH[p.channel]||CH.other).name;
   const nm=String(p.title||"post").replace(/[^\w\-]+/g,"-").replace(/^-+|-+$/g,"")||"post";
   $("#modalRoot").innerHTML='<div class="scrim" data-act="closeScrim"><div class="modal kit" role="dialog" aria-modal="true" aria-label="Posting kit"><h3>Posting kit</h3><p class="hint" style="margin:0 0 10px">'+esc(p.title||"Untitled post")+' · '+esc(ch)+(p.date?' · '+esc(fmtDate(p.date))+(p.time?" at "+esc(fmtTime(p.time)):""):"")+'. Add the media in this order. Tap Copy photo, or press and hold a photo and choose Copy or Save.</p>'
-   +(items.length?items.map((it,i)=>'<figure class="kf"><span class="kn">'+(i+1)+'</span><img alt="'+(it.k==="v"?"Video still":"Graphic")+' '+(i+1)+'" src="/blob/'+esc(it.id)+'">'+(it.k==="v"?'<span class="vbadge" aria-hidden="true"></span>':"")+'<figcaption><b>'+(i+1)+'. '+(it.k==="v"?"Video: "+esc(p.video.name||"clip"):"Photo or graphic")+'</b>'+(it.k==="v"?'<span class="hint" style="margin:0;flex:1 1 100%">This is the cover still. Post the full video from your computer or OneDrive'+(p.video.url?'. <a href="'+esc(p.video.url)+'" target="_blank" rel="noopener">Open video</a>':"")+'.</span>':"")+'<button class="btn primary sm" type="button" data-act="kitcopy" data-id="'+esc(it.id)+'">Copy photo</button><button class="btn sm" type="button" data-act="kitsave" data-id="'+esc(it.id)+'" data-n="'+esc(nm+"-"+(i+1))+'">Save</button></figcaption></figure>').join(""):'<p class="empty">This post has no photos or graphics yet.</p>')
+   +(items.length?items.map((it,i)=>'<figure class="kf"><span class="kn">'+(i+1)+'</span><img alt="'+(it.k==="v"?"Video still":"Graphic")+' '+(i+1)+'" src="blob/'+esc(it.id)+'">'+(it.k==="v"?'<span class="vbadge" aria-hidden="true"></span>':"")+'<figcaption><b>'+(i+1)+'. '+(it.k==="v"?"Video: "+esc(p.video.name||"clip"):"Photo or graphic")+'</b>'+(it.k==="v"?'<span class="hint" style="margin:0;flex:1 1 100%">This is the cover still. Post the full video from your computer or OneDrive'+(p.video.url?'. <a href="'+esc(p.video.url)+'" target="_blank" rel="noopener">Open video</a>':"")+'.</span>':"")+'<button class="btn primary sm" type="button" data-act="kitcopy" data-id="'+esc(it.id)+'">Copy photo</button><button class="btn sm" type="button" data-act="kitsave" data-id="'+esc(it.id)+'" data-n="'+esc(nm+"-"+(i+1))+'">Save</button></figcaption></figure>').join(""):'<p class="empty">This post has no photos or graphics yet.</p>')
    +'<h4 style="margin:14px 0 6px">Caption</h4><pre class="kcap" id="kitcap">'+esc(p.caption||"")+(p.hashtags?"\n\n"+esc(p.hashtags):"")+'</pre><div class="acts" style="margin:0"><button class="btn primary sm" type="button" data-act="kitcap" data-id="'+p.id+'">Copy caption and hashtags</button><button class="btn sm" type="button" data-act="kitcaponly" data-id="'+p.id+'">Copy caption only</button></div>'
    +(p.channel==="linkedin"?'<p class="hint">LinkedIn will not turn pasted @names into tags. Type each @ in the LinkedIn box and pick the profile.</p>':"")
    +'<div class="acts"><button class="btn" type="button" data-act="closeModal">Close</button></div></div></div>';
@@ -1504,7 +1557,7 @@ function drawOrder(){
   const el=$("#b_order");if(!el||!B)return;const a=mediaItems();
   if(a.length<2){el.innerHTML="";return}
   const ro=!S.canWrite||(B.id&&locked(S.posts.find(x=>x.id===B.id)||{}));
-  el.innerHTML='<span style="font-size:13px;font-weight:600;color:var(--muted)">Order'+(ro?"":' (drag to rearrange, or tap and use ← →)')+'</span><div class="ord" id="ordrow" role="list">'+a.map((it,i)=>'<div class="oi'+(i===Math.min(B.pi,a.length-1)?" sel":"")+'" role="listitem" tabindex="0" data-i="'+i+'" aria-label="'+(it.k==="v"?"Video":"Graphic")+' '+(i+1)+' of '+a.length+'"><img alt="" src="/blob/'+esc(it.id)+'"><span class="on">'+(i+1)+'</span>'+(it.k==="v"?'<span class="pl" aria-hidden="true">▶</span>':"")+'</div>').join("")+'</div>';
+  el.innerHTML='<span style="font-size:13px;font-weight:600;color:var(--muted)">Order'+(ro?"":' (drag to rearrange, or tap and use ← →)')+'</span><div class="ord" id="ordrow" role="list">'+a.map((it,i)=>'<div class="oi'+(i===Math.min(B.pi,a.length-1)?" sel":"")+'" role="listitem" tabindex="0" data-i="'+i+'" aria-label="'+(it.k==="v"?"Video":"Graphic")+' '+(i+1)+' of '+a.length+'"><img alt="" src="blob/'+esc(it.id)+'"><span class="on">'+(i+1)+'</span>'+(it.k==="v"?'<span class="pl" aria-hidden="true">▶</span>':"")+'</div>').join("")+'</div>';
   if(ro)return;
   const row=$("#ordrow");let drag=null;
   row.onpointerdown=e=>{const it=e.target.closest(".oi");if(!it)return;drag={el:it,i:+it.dataset.i,x:e.clientX,on:false,to:+it.dataset.i};try{it.setPointerCapture(e.pointerId)}catch(x){}};
@@ -1525,7 +1578,7 @@ function drawOrder(){
 }
 function tagify(t){return esc(t).replace(/(^|[^&\w])(#\w+)/g,'$1<span class="tg">$2</span>')}
 function updatePreview(){
-  if(!B||!$("#b_prev"))return;drawOrder();const d=draft(),media=mediaIds(),mi=Math.min(B.pi,Math.max(media.length-1,0)),src=media.length?"/blob/"+media[mi]:"";
+  if(!B||!$("#b_prev"))return;drawOrder();const d=draft(),media=mediaIds(),mi=Math.min(B.pi,Math.max(media.length-1,0)),src=media.length?"blob/"+media[mi]:"";
   const cur=mediaItems()[mi],isVid=!!(cur&&cur.k==="v");
   const gfx=src?'<img class="cover" alt="Post graphic" onload="igfit(this)" src="'+esc(src)+'">'+(isVid?'<span class="vbadge" aria-hidden="true"></span>':""):(B.video?'<span style="padding:20px">Video: '+esc(B.video.name||"clip")+'. Add a still photo.</span>':"");
   if(B.pv==="linkedin"){
@@ -1537,7 +1590,7 @@ function updatePreview(){
 }
 function drawThumbs(){
   const t=$("#b_thumbs");if(!t)return;const ro=!S.canWrite||(B.id&&locked(S.posts.find(x=>x.id===B.id)||{}));
-  t.innerHTML=B.photoIds.length?B.photoIds.map((id,i)=>'<div class="th"><img alt="Graphic '+(i+1)+'" src="/blob/'+esc(id)+'">'+(ro?"":'<button type="button" data-act="rmgfx" data-i="'+i+'" aria-label="Remove graphic '+(i+1)+'">×</button>')+'</div>').join(""):'<span class="hint">No graphic yet.</span>';
+  t.innerHTML=B.photoIds.length?B.photoIds.map((id,i)=>'<div class="th"><img alt="Graphic '+(i+1)+'" src="blob/'+esc(id)+'">'+(ro?"":'<button type="button" data-act="rmgfx" data-i="'+i+'" aria-label="Remove graphic '+(i+1)+'">×</button>')+'</div>').join(""):'<span class="hint">No graphic yet.</span>';
   drawOrder();
 }
 async function saveBuilder(force){
@@ -1570,7 +1623,7 @@ function drawVideo(){
   drawOrder();const el=$("#b_video");if(!el||!B)return;const ro=!S.canWrite||(B.id&&locked(S.posts.find(x=>x.id===B.id)||{}));const v=B.video;
   if(!v){el.innerHTML='<span class="hint">No video yet.</span>';return}
   const where=v.assetId?"Stored in the Hub.":(v.url?"Lives on OneDrive or another site. A still photo stands in here.":"Too large for the Hub. A still photo stands in here. Post the full video from your computer or OneDrive.");
-  el.innerHTML='<div style="display:flex;gap:10px;align-items:center">'+(v.stillId?'<div class="th" style="position:relative"><img alt="Video still" src="/blob/'+esc(v.stillId)+'"><span class="vbadge sm" aria-hidden="true"></span></div>':'<div class="th" style="display:grid;place-items:center;font-size:12px;color:var(--muted);text-align:center">No still</div>')
+  el.innerHTML='<div style="display:flex;gap:10px;align-items:center">'+(v.stillId?'<div class="th" style="position:relative"><img alt="Video still" src="blob/'+esc(v.stillId)+'"><span class="vbadge sm" aria-hidden="true"></span></div>':'<div class="th" style="display:grid;place-items:center;font-size:12px;color:var(--muted);text-align:center">No still</div>')
    +'<div style="min-width:0"><b style="display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(v.name||"Video")+'</b><span style="font-size:13px;color:var(--muted)">'+esc(where)+(v.stillId?"":" Add a still photo below.")+'</span>'+(v.url?'<br><a href="'+esc(v.url)+'" target="_blank" rel="noopener" style="font-size:13px">Open video</a>':"")+'</div>'
    +(ro?"":'<button class="btn sm" type="button" data-act="rmvid" style="margin-left:auto">Remove</button>')+'</div>';
 }
@@ -1628,7 +1681,7 @@ async function useLibVideo(id){
   const lv=S.videos.find(x=>x.id===id);if(!lv||!B)return;
   const vid={name:lv.title||"Video"};if(lv.url)vid.url=lv.url;if(lv.assetId)vid.assetId=lv.assetId;
   B.video=vid;$("#b_vpick").innerHTML="";drawVideo();updatePreview();
-  if(S.assets){let still=lv.assetId?await captureStill("/blob/"+lv.assetId):null;if(!still)still=await makePlaceholder(vid.name);if(still){try{const r=await S.assets.upload(still,{type:"image/jpeg"});if(B.video===vid){vid.stillId=r.id;drawVideo();updatePreview()}}catch(e){}}}
+  if(S.assets){let still=lv.assetId?await captureStill("blob/"+lv.assetId):null;if(!still)still=await makePlaceholder(vid.name);if(still){try{const r=await S.assets.upload(still,{type:"image/jpeg"});if(B.video===vid){vid.stillId=r.id;drawVideo();updatePreview()}}catch(e){}}}
 }
 async function uploadGfx(files){
   if(!S.assets||!B)return;const arr=[...files].filter(f=>f.type.startsWith("image/"));let n=0;
@@ -1744,7 +1797,7 @@ function photosView(){
   h+='<div class="filters">'+[{id:"all",name:"All"},...CATS,{id:"general",name:"General"}].map(c=>'<button class="fchip" data-act="pf" data-id="'+c.id+'" aria-pressed="'+(S.pf===c.id)+'">'+(c.id!=="all"?'<span class="dot" style="--cat:'+catVar(c.id)+'"></span>':"")+esc(c.name)+'</button>').join("")+'</div>';
   if(S.assets&&S.canWrite)h+='<div class="drop" id="drop"><p style="margin:0 0 10px">Drop photos here to add them to <b>'+esc(S.pf==="all"?"General":CAT[S.pf].name)+'</b>, or</p><label class="btn primary" style="display:inline-block;cursor:pointer"><input type="file" id="fileIn" accept="image/*" multiple hidden>Choose photos</label></div>';
   else if(!S.offline)h+='<div class="note">Photo uploads are limited to people with Contributor access or higher.</div>';
-  h+=list.length?'<div class="gal">'+list.map(p=>'<button class="ph" data-act="photo" data-id="'+p.id+'" aria-label="Open photo '+esc(p.caption||"")+'"><img loading="lazy" alt="'+esc(p.caption||"Team photo")+'" src="/blob/'+esc(p.assetId)+'"><span class="cap">'+esc(p.caption||(CAT[p.cat]||CAT.general).name)+'</span></button>').join("")+'</div>':'<div class="panel"><p class="empty">No photos in this category yet.'+((S.assets&&S.canWrite)?" Add the first ones above.":"")+'</p></div>';
+  h+=list.length?'<div class="gal">'+list.map(p=>'<button class="ph" data-act="photo" data-id="'+p.id+'" aria-label="Open photo '+esc(p.caption||"")+'"><img loading="lazy" alt="'+esc(p.caption||"Team photo")+'" src="blob/'+esc(p.assetId)+'"><span class="cap">'+esc(p.caption||(CAT[p.cat]||CAT.general).name)+'</span></button>').join("")+'</div>':'<div class="panel"><p class="empty">No photos in this category yet.'+((S.assets&&S.canWrite)?" Add the first ones above.":"")+'</p></div>';
   return h;
 }
 async function shrink(file){
@@ -1781,7 +1834,7 @@ function videosView(){
     h+='<div class="drop" id="drop"><p style="margin:0 0 10px">'+(S.assets?'Drop a video here to add it to '+dest+', or':'Add a video link to '+dest+':')+'</p><div class="acts" style="justify-content:center;margin:0">'+(S.assets?'<label class="btn primary" style="display:inline-block;cursor:pointer"><input type="file" id="vidIn" accept="video/*" multiple hidden>Choose video</label>':'')+'<button class="btn" type="button" data-act="addvlink">Add a link</button></div><p class="hint" style="margin:10px 0 0">Uploads can be up to 20 MB. For longer clips, upload to Drive, OneDrive or YouTube and add the link.</p></div>';
   } else if(!S.offline)h+='<div class="note">Adding videos is limited to people with Contributor access or higher.</div>';
   h+=list.length?'<div class="vgal">'+list.map(v=>{
-    const media=v.assetId?'<video muted preload="metadata" playsinline src="/blob/'+esc(v.assetId)+'#t=0.1" aria-hidden="true"></video><span class="play"></span>':'<span class="vlink">'+esc(vhost(v.url))+'</span><span class="play"></span>';
+    const media=v.assetId?'<video muted preload="metadata" playsinline src="blob/'+esc(v.assetId)+'#t=0.1" aria-hidden="true"></video><span class="play"></span>':'<span class="vlink">'+esc(vhost(v.url))+'</span><span class="play"></span>';
     return '<button class="vc" data-act="video" data-id="'+v.id+'" style="text-align:left;padding:0" aria-label="Open video '+esc(v.title||"")+'"><span class="vm">'+media+'</span><span class="vi"><b>'+esc(v.title||"Untitled video")+'</b><span><span class="dot" style="--cat:'+catVar(v.cat||"general")+';display:inline-block;margin-right:6px"></span>'+esc(vcat(v))+(v.date?' · '+esc(v.date):'')+'</span></span></button>';
   }).join("")+'</div>':'<div class="panel"><p class="empty">No videos in this category yet.'+(S.canWrite?" Add the first one above.":"")+'</p></div>';
   return h;
@@ -1805,13 +1858,13 @@ function openVideoLink(){
 }
 function openVideo(id){
   const v=S.videos.find(x=>x.id===id);if(!v)return;const ro=!S.canWrite;
-  const media=v.assetId?'<video controls playsinline preload="metadata" src="/blob/'+esc(v.assetId)+'"></video>':'<p><a class="btn primary" href="'+esc(v.url)+'" target="_blank" rel="noopener">Open video on '+esc(vhost(v.url))+'</a></p><p class="hint" style="word-break:break-all">'+esc(v.url)+'</p>';
+  const media=v.assetId?'<video controls playsinline preload="metadata" src="blob/'+esc(v.assetId)+'"></video>':'<p><a class="btn primary" href="'+esc(v.url)+'" target="_blank" rel="noopener">Open video on '+esc(vhost(v.url))+'</a></p><p class="hint" style="word-break:break-all">'+esc(v.url)+'</p>';
   $("#modalRoot").innerHTML='<div class="scrim" data-act="closeScrim"><form class="modal lb" id="vForm" role="dialog" aria-modal="true" aria-label="Video">'+media+'<div class="f"><label class="full">Title<input type="text" id="v_t" value="'+esc(v.title||"")+'" '+(ro?"disabled":"")+'></label><label>Category<select id="v_c" '+(ro?"disabled":"")+'>'+[...CATS,{id:"general",name:"General"}].map(c=>'<option value="'+c.id+'"'+((v.cat||"general")===c.id?" selected":"")+'>'+esc(c.name)+'</option>').join("")+'</select></label><label>Date<input type="date" id="v_d" value="'+esc(v.date||"")+'" '+(ro?"disabled":"")+'></label></div><div class="acts">'+(ro?"":'<button class="btn primary" type="submit">Save</button>')+'<button class="btn" type="button" data-act="closeModal">Close</button>'+(v.url?'<button class="btn" type="button" data-act="cpvlink" data-id="'+v.id+'">Copy link</button>':'')+(ro?"":'<span class="sp"></span><button class="btn danger" type="button" data-act="delvideo" data-id="'+v.id+'">Delete video</button>')+'</div></form></div>';
   $("#vForm").addEventListener("submit",async e=>{e.preventDefault();await saveDoc("videos",v.id,{...v,title:$("#v_t").value.trim(),cat:$("#v_c").value,date:$("#v_d").value});closeModal();render(true);toast("Saved")});
 }
 function openPhoto(id){
   const p=S.photos.find(x=>x.id===id);if(!p)return;const ro=!S.canWrite;
-  $("#modalRoot").innerHTML='<div class="scrim" data-act="closeScrim"><form class="modal lb" id="phForm" role="dialog" aria-modal="true" aria-label="Photo"><img alt="'+esc(p.caption||"Team photo")+'" src="/blob/'+esc(p.assetId)+'"><div class="f"><label class="full">Caption<input type="text" id="p_cap" value="'+esc(p.caption||"")+'" '+(ro?"disabled":"")+'></label><label>Category<select id="p_cat" '+(ro?"disabled":"")+'>'+[...CATS,{id:"general",name:"General"}].map(c=>'<option value="'+c.id+'"'+((p.cat||"general")===c.id?" selected":"")+'>'+esc(c.name)+'</option>').join("")+'</select></label><label>Date<input type="date" id="p_date" value="'+esc(p.date||"")+'" '+(ro?"disabled":"")+'></label></div><div class="acts">'+(ro?"":'<button class="btn primary" type="submit">Save</button>')+'<button class="btn" type="button" data-act="closeModal">Close</button>'+(ro?"":'<span class="sp"></span><button class="btn danger" type="button" data-act="delphoto" data-id="'+p.id+'">Delete photo</button>')+'</div></form></div>';
+  $("#modalRoot").innerHTML='<div class="scrim" data-act="closeScrim"><form class="modal lb" id="phForm" role="dialog" aria-modal="true" aria-label="Photo"><img alt="'+esc(p.caption||"Team photo")+'" src="blob/'+esc(p.assetId)+'"><div class="f"><label class="full">Caption<input type="text" id="p_cap" value="'+esc(p.caption||"")+'" '+(ro?"disabled":"")+'></label><label>Category<select id="p_cat" '+(ro?"disabled":"")+'>'+[...CATS,{id:"general",name:"General"}].map(c=>'<option value="'+c.id+'"'+((p.cat||"general")===c.id?" selected":"")+'>'+esc(c.name)+'</option>').join("")+'</select></label><label>Date<input type="date" id="p_date" value="'+esc(p.date||"")+'" '+(ro?"disabled":"")+'></label></div><div class="acts">'+(ro?"":'<button class="btn primary" type="submit">Save</button>')+'<button class="btn" type="button" data-act="closeModal">Close</button>'+(ro?"":'<span class="sp"></span><button class="btn danger" type="button" data-act="delphoto" data-id="'+p.id+'">Delete photo</button>')+'</div></form></div>';
   $("#phForm").addEventListener("submit",async e=>{e.preventDefault();await saveDoc("photos",p.id,{...p,caption:$("#p_cap").value.trim(),cat:$("#p_cat").value,date:$("#p_date").value});closeModal();render(true);toast("Saved")});
 }
 
@@ -1820,7 +1873,7 @@ function libList(){
   const q=S.libq.toLowerCase(),k=S.libTab;
   const l=S.lib.filter(x=>(x.kind===k||(k==="captions"&&x.kind==="caption"))&&(!q||((x.title||"")+" "+(x.text||"")).toLowerCase().includes(q)));
   if(!l.length)return '<p class="empty">'+(q?"Nothing matches that search.":"Nothing saved here yet."+(S.canWrite?" Add the first one above.":""))+'</p>';
-  return '<div class="libg">'+l.map(x=>x.kind==="graphics"?'<div class="libi"><img alt="'+esc(x.title||"Graphic")+'" loading="lazy" src="/blob/'+esc(x.assetId)+'"><b>'+esc(x.title||"Graphic")+'</b><div class="pact"><button class="btn sm" data-act="dlgfx" data-id="'+x.id+'">Download</button>'+(S.canWrite?'<button class="btn sm danger" data-act="dellib" data-id="'+x.id+'">Delete</button>':"")+'</div></div>':'<div class="libi"><b>'+esc(x.title)+'</b><pre>'+esc(x.text)+'</pre><div class="pact"><button class="btn sm" data-act="libcopy" data-id="'+x.id+'">Copy</button>'+(S.canWrite?'<button class="btn sm danger" data-act="dellib" data-id="'+x.id+'">Delete</button>':"")+'</div></div>').join("")+'</div>';
+  return '<div class="libg">'+l.map(x=>x.kind==="graphics"?'<div class="libi"><img alt="'+esc(x.title||"Graphic")+'" loading="lazy" src="blob/'+esc(x.assetId)+'"><b>'+esc(x.title||"Graphic")+'</b><div class="pact"><button class="btn sm" data-act="dlgfx" data-id="'+x.id+'">Download</button>'+(S.canWrite?'<button class="btn sm danger" data-act="dellib" data-id="'+x.id+'">Delete</button>':"")+'</div></div>':'<div class="libi"><b>'+esc(x.title)+'</b><pre>'+esc(x.text)+'</pre><div class="pact"><button class="btn sm" data-act="libcopy" data-id="'+x.id+'">Copy</button>'+(S.canWrite?'<button class="btn sm danger" data-act="dellib" data-id="'+x.id+'">Delete</button>':"")+'</div></div>').join("")+'</div>';
 }
 function libraryPanel(){
   const k=S.libTab;
@@ -1850,7 +1903,7 @@ async function dlLogo(v){
 async function dlGfx(id){
   const x=S.lib.find(l=>l.id===id);if(!x)return;
   if(!S.dl){toast("Downloads are not available here.");return}
-  try{const r=await fetch("/blob/"+x.assetId);const bl=await r.blob();const ext=(bl.type.split("/")[1]||"png").replace("jpeg","jpg");await S.dl.save({filename:((x.title||"graphic").replace(/[^\w\- ]+/g,"").trim()||"graphic")+"."+ext,data:bl})}catch(e){if(!e||e.code!=="declined")toast("Could not download that graphic.")}
+  try{const r=await fetch("blob/"+x.assetId);const bl=await r.blob();const ext=(bl.type.split("/")[1]||"png").replace("jpeg","jpg");await S.dl.save({filename:((x.title||"graphic").replace(/[^\w\- ]+/g,"").trim()||"graphic")+"."+ext,data:bl})}catch(e){if(!e||e.code!=="declined")toast("Could not download that graphic.")}
 }
 async function copyText(t,msg){try{await navigator.clipboard.writeText(t);toast(msg||("Copied "+t))}catch(e){toast("Copy this by hand: "+t.slice(0,60))}}
 
@@ -1933,7 +1986,7 @@ document.addEventListener("click",async e=>{
   else if(a==="kitcap"||a==="kitcaponly"){const p=S.posts.find(x=>x.id===id);if(p)copyText(a==="kitcap"?(p.caption||"")+(p.hashtags?"\n\n"+p.hashtags:""):(p.caption||""),"Caption copied")}
   else if(a==="fmtgen")genSlides();
   else if(a==="fmtcap")fmtCaption();
-  else if(a==="fmtphoto"){const el2=$("#b_fphotos");if(el2.innerHTML){el2.innerHTML="";return}const src=[...new Set([...S.photos.map(p=>p.assetId),...S.lib.filter(l=>l.kind==="graphics").map(l=>l.assetId)])];el2.innerHTML=src.length?'<div class="pick">'+src.map(s=>'<button type="button" data-act="fmtpick" data-id="'+esc(s)+'"><img alt="Photo" loading="lazy" src="/blob/'+esc(s)+'"></button>').join("")+'</div>':'<p class="hint">No photos yet. Add some on the Photos tab.</p>'}
+  else if(a==="fmtphoto"){const el2=$("#b_fphotos");if(el2.innerHTML){el2.innerHTML="";return}const src=[...new Set([...S.photos.map(p=>p.assetId),...S.lib.filter(l=>l.kind==="graphics").map(l=>l.assetId)])];el2.innerHTML=src.length?'<div class="pick">'+src.map(s=>'<button type="button" data-act="fmtpick" data-id="'+esc(s)+'"><img alt="Photo" loading="lazy" src="blob/'+esc(s)+'"></button>').join("")+'</div>':'<p class="hint">No photos yet. Add some on the Photos tab.</p>'}
   else if(a==="fmtpick"){gatherFmt();B.fmt.photo=id;drawFormat()}
   else if(a==="fmtnophoto"){gatherFmt();delete B.fmt.photo;drawFormat()}
   else if(a==="resubmit"||a==="tore"){await doStage(id,"review","Sent to review");if($("#modalRoot").innerHTML)closeModal()}
@@ -1951,7 +2004,7 @@ document.addEventListener("click",async e=>{
   else if(a==="cptag")copyText(formVal("b_tags"),"Hashtags copied");
   else if(a==="cpboth")copyText(formVal("b_cap")+"\n\n"+formVal("b_tags"),"Caption and hashtags copied");
   else if(a==="rmgfx"){B.photoIds.splice(Number(el.dataset.i),1);B.pi=0;drawThumbs();updatePreview()}
-  else if(a==="pickgfx"){const el2=$("#b_pick");if(el2.innerHTML){el2.innerHTML="";return}const src=[...S.lib.filter(l=>l.kind==="graphics").map(l=>l.assetId),...S.photos.map(p=>p.assetId)];el2.innerHTML=src.length?'<div class="pick">'+src.map(s=>'<button type="button" data-act="addgfx" data-id="'+esc(s)+'"><img alt="Library graphic" src="/blob/'+esc(s)+'"></button>').join("")+'</div>':'<p class="hint">No graphics in the library or Photos yet.</p>'}
+  else if(a==="pickgfx"){const el2=$("#b_pick");if(el2.innerHTML){el2.innerHTML="";return}const src=[...S.lib.filter(l=>l.kind==="graphics").map(l=>l.assetId),...S.photos.map(p=>p.assetId)];el2.innerHTML=src.length?'<div class="pick">'+src.map(s=>'<button type="button" data-act="addgfx" data-id="'+esc(s)+'"><img alt="Library graphic" src="blob/'+esc(s)+'"></button>').join("")+'</div>':'<p class="hint">No graphics in the library or Photos yet.</p>'}
   else if(a==="addgfx"){if(!B.photoIds.includes(id))B.photoIds.push(id);drawThumbs();updatePreview()}
   else if(a==="inscap"){const x=S.lib.find(l=>l.id===formVal("b_libcap"));if(x){$("#b_cap").value=x.text;updatePreview()}}
   else if(a==="instag"){const x=S.lib.find(l=>l.id===formVal("b_libtag"));if(x){$("#b_tags").value=x.text;updatePreview()}}
